@@ -3,10 +3,12 @@ const aws = require('aws-sdk');
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const proxy = require('https-proxy-agent');
 
-// The max time that a GitHub action is allowed to run is 6 hours.
-// That seems like a reasonable default to use if no role duration is defined.
+// Use 1hr as role duration when using session token or OIDC
+// Otherwise, use the max duration of GitHub action (6hr)
 const MAX_ACTION_RUNTIME = 6 * 3600;
+const SESSION_ROLE_DURATION = 3600;
 const DEFAULT_ROLE_DURATION_FOR_OIDC_ROLES = 3600;
 const USER_AGENT = 'configure-aws-credentials-for-github-actions';
 const MAX_TAG_VALUE_LENGTH = 256;
@@ -86,7 +88,7 @@ async function assumeRole(params) {
   }
 
   let assumeFunction = sts.assumeRole.bind(sts);
-  
+
   // These are customizations needed for the GH OIDC Provider
   if(isDefined(webIdentityToken)) {
     delete assumeRoleRequest.Tags;
@@ -111,8 +113,8 @@ async function assumeRole(params) {
     } catch(error) {
       throw new Error(`Web identity token file could not be read: ${error.message}`);
     }
-    
-  } 
+
+  }
 
   return assumeFunction(assumeRoleRequest)
     .promise()
@@ -260,21 +262,45 @@ const retryAndBackoff = async (fn, isRetryable, retries = 0, maxRetries = 12, ba
   }
 }
 
+function configureProxy(proxyServer) {
+  const proxyFromEnv = process.env.HTTP_PROXY || process.env.http_proxy;
+
+  if (proxyFromEnv || proxyServer) {
+    let proxyToSet = null;
+
+    if (proxyServer){
+      console.log(`Setting proxy from actions input: ${proxyServer}`);
+      proxyToSet = proxyServer;
+    } else {
+      console.log(`Setting proxy from environment: ${proxyFromEnv}`);
+      proxyToSet = proxyFromEnv;
+    }
+
+    aws.config.update({
+      httpOptions: { agent: proxy(proxyToSet) }
+    });
+  }
+}
+
 async function run() {
   try {
     // Get inputs
     const accessKeyId = core.getInput('aws-access-key-id', { required: false });
+    const audience = core.getInput('audience', { required: false });
     const secretAccessKey = core.getInput('aws-secret-access-key', { required: false });
     const region = core.getInput('aws-region', { required: false }) || AWS_CURRENT_REGION;
     const sessionToken = core.getInput('aws-session-token', { required: false });
     const maskAccountId = core.getInput('mask-aws-account-id', { required: false });
     const roleToAssume = core.getInput('role-to-assume', {required: false});
     const roleExternalId = core.getInput('role-external-id', { required: false });
-    let roleDurationSeconds = core.getInput('role-duration-seconds', {required: false}) || MAX_ACTION_RUNTIME;
+    let roleDurationSeconds = core.getInput('role-duration-seconds', {required: false})
+    || (sessionToken && SESSION_ROLE_DURATION)
+    || MAX_ACTION_RUNTIME;
     const roleSessionName = core.getInput('role-session-name', { required: false }) || ROLE_SESSION_NAME;
     const roleSkipSessionTaggingInput = core.getInput('role-skip-session-tagging', { required: false })|| 'false';
     const roleSkipSessionTagging = roleSkipSessionTaggingInput.toLowerCase() === 'true';
     const webIdentityTokenFile = core.getInput('web-identity-token-file', { required: false });
+    const proxyServer = core.getInput('http-proxy', { required: false });
 
     if (!region.match(REGION_REGEX)) {
       throw new Error(`Region is not valid: ${region}`);
@@ -305,13 +331,16 @@ async function run() {
       exportCredentials({accessKeyId, secretAccessKey, sessionToken});
     }
     
+    // Configures proxy
+    configureProxy(proxyServer);
+
     // Attempt to load credentials from the GitHub OIDC provider.
     // If a user provides an IAM Role Arn and DOESN'T provide an Access Key Id
     // The only way to assume the role is via GitHub's OIDC provider.
     let sourceAccountId;
     let webIdentityToken;
     if(useGitHubOIDCProvider()) {
-      webIdentityToken = await core.getIDToken('sts.amazonaws.com');
+      webIdentityToken = await core.getIDToken(audience);
       roleDurationSeconds = core.getInput('role-duration-seconds', {required: false}) || DEFAULT_ROLE_DURATION_FOR_OIDC_ROLES;
       // We don't validate the credentials here because we don't have them yet when using OIDC.
     } else {
